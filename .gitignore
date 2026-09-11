@@ -1,0 +1,8 @@
+node_modules
+.env
+.env.*
+!.env.example
+uploads/
+src/uploads/
+docs/.render/
+docs/__pycache__/
