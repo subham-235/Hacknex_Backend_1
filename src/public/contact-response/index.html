@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Respond to SOS · Suraksha</title>
+  <link rel="stylesheet" href="/agent/respond/style.css">
+  <script defer src="/agent/respond/app.js"></script>
+</head>
+<body>
+  <main>
+    <header><span class="brand">suraksha.</span><span class="badge">TRUSTED CONTACT</span></header>
+    <section class="card">
+      <p class="eyebrow">A PERSON WHO TRUSTS YOU NEEDS HELP</p>
+      <h1>Let them know<br>you’re here.</h1>
+      <p>You received this private link as an emergency contact. Your response goes directly to their SOS dashboard.</p>
+      <p id="reference" class="reference"></p>
+      <p id="status" role="status" aria-live="polite">Checking this response link…</p>
+      <p id="error" role="alert"></p>
+      <div class="actions">
+        <button id="coming" disabled>I’m coming to help</button>
+        <button id="cannot" class="secondary" disabled>Cannot help</button>
+        <button id="arrived" class="secondary" hidden>I have arrived</button>
+      </div>
+    </section>
+    <section id="location-section" class="card" hidden>
+      <h2>Help them see you approaching</h2>
+      <p>Optionally share your live location with the person who sent this SOS. They’ll see your approximate distance while this page stays open.</p>
+      <button id="share" class="secondary">Share my live location</button>
+      <p id="location-status" role="status" aria-live="polite">Location sharing is off.</p>
+      <a id="directions" target="_blank" rel="noopener noreferrer" hidden>Open their location in Maps ↗</a>
+      <p id="victim-location-note" class="fine"></p>
+    </section>
+    <footer>Keep this link private: anyone with it can respond as this contact. It expires when the SOS closes or its time limit is reached. Arrival does not close the SOS; the person marks themselves safe.</footer>
+    <noscript>Enable JavaScript to respond. If you cannot use this page, contact the person directly.</noscript>
+  </main>
+</body>
+</html>

@@ -1,10 +1,9 @@
 
-const { GoogleGenAI } = require("@google/genai");
 const path = require("path");
+const fs = require("node:fs/promises");
+const { createGeminiFailover } = require("./geminiFailover");
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
+const ai = createGeminiFailover();
 
 
 const analyzeAudioDirectly = async (audioPath, location) => {
@@ -14,9 +13,6 @@ const analyzeAudioDirectly = async (audioPath, location) => {
     }
 
    
-    const extension = path
-      .extname(audioPath)
-      .toLowerCase();
 
 
     const mimeTypes = {
@@ -32,38 +28,23 @@ const analyzeAudioDirectly = async (audioPath, location) => {
       ".mp4": "video/mp4",
     };
 
-    const mimeType =
-      mimeTypes[extension];
-
-    if (!mimeType) {
-      throw new Error(
-        `Unsupported audio format: ${extension}`
-      );
+    const paths = Array.isArray(audioPath) ? audioPath : [audioPath];
+    if (!paths.length || paths.length > 5) throw new Error("Expected one to five audio clips");
+    const sizes = await Promise.all(paths.map(file => fs.stat(file)));
+    // Base64 adds ~33%; leave ample room below the 20 MB request limit.
+    if (sizes.reduce((sum, info) => sum + info.size, 0) > 12 * 1024 * 1024) {
+      throw new Error("Audio batch exceeds inline request limit");
     }
-
-    console.log("Uploading file to Gemini...");
-    console.log("Audio:", audioPath);
-    console.log("MIME:", mimeType);
-
-    const uploadedFile = await ai.files.upload({
-      file: audioPath,
-
-      config: {
-        mimeType,
-      },
-    });
-
-    console.log(
-      "Gemini file uploaded:",
-      uploadedFile.uri
-    );
-
-  
-
+    const audioParts = await Promise.all(paths.map(async file => {
+      const mimeType = mimeTypes[path.extname(file).toLowerCase()];
+      if (!mimeType) throw new Error("Unsupported audio format");
+      return { inlineData: { mimeType, data: (await fs.readFile(file)).toString("base64") } };
+    }));
+    const analysisStartedAt = Date.now();
     const prompt = `
 You are an emergency distress detection AI.
 
-Analyze the provided audio carefully.
+Analyze the provided audio clips in chronological order as one recording. Return one result for the whole batch. Keep the summary and reason to one short sentence each.
 
 The user's approximate location is:
 
@@ -108,7 +89,7 @@ The JSON must have exactly this structure:
 `;
 
     const response =
-      await ai.models.generateContent({
+      await ai.generateContent({
         model: "gemini-3.6-flash",
 
         contents: [
@@ -116,17 +97,13 @@ The JSON must have exactly this structure:
             text: prompt,
           },
 
-          {
-            fileData: {
-              fileUri: uploadedFile.uri,
-              mimeType: uploadedFile.mimeType,
-            },
-          },
+          ...audioParts,
         ],
       });
 
 
 
+    console.log("SOS timing", { stage: "gemini_analysis", elapsedMs: Date.now() - analysisStartedAt, clips: paths.length });
     const rawText =
       response.text?.trim();
 

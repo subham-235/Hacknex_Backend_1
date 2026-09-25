@@ -1,5 +1,5 @@
 const { ACTIVE } = require("./policy");
-function createDispatcher({ Session, queue }) {
+function createDispatcher({ Session, queue, enabled = true }) {
   let dispatching = false;
   return async function dispatch() {
     if (dispatching) return;
@@ -10,6 +10,7 @@ function createDispatcher({ Session, queue }) {
       await Session.updateMany({ ready: false, initialDeadline: { $lte: new Date() }, status: { $in: ACTIVE } }, {
         $set: { ready: true, "attempts.$[pending].status": "unknown", lastError: "Initial alert processing was interrupted; inspect SMS provider records" },
       }, { arrayFilters: [{ "pending.status": "pending" }] });
+      if (!enabled) return;
       // Persisted schedules recover from queue loss or downtime.
       const due = await Session.find({ ready: true, status: { $in: ACTIVE }, nextRunAt: { $lte: new Date() }, leaseUntil: { $lte: new Date() } }).select("_id").sort({ nextRunAt: 1 }).limit(100).lean();
       for (const session of due) await queue.add("review-session", { sessionId: String(session._id) }, { jobId: `session-${session._id}` });

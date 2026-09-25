@@ -21,6 +21,8 @@ const ActiveUserSchema = new mongoose.Schema({
   socketId: { type: String, default: null },
   isActive: { type: Boolean, default: true },
   lastSeen: { type: Date, default: Date.now },
+  locationObservedAt: Date,
+  accuracy: Number,
   expireAt: {
     type: Date,
     default: () => new Date(Date.now() + 10 * 60 * 1000),
@@ -32,4 +34,3 @@ const ActiveUserSchema = new mongoose.Schema({
 ActiveUserSchema.index({ location: "2dsphere" });
 
 module.exports = mongoose.model("ActiveUser", ActiveUserSchema);
-

@@ -3,7 +3,7 @@ const Session = require("../models/emergencySession");
 const Contact = require("../models/contact");
 const ActiveUser = require("../models/activeUser");
 const { canFollowUp, ACTIVE } = require("./policy");
-const { callbackUrl, recordAttempt } = require("./sessions");
+const { callbackUrl, recordAttempt, issueContactLink } = require("./sessions");
 const { sendMessage } = require("../services/smsGateway");
 
 async function latestLocation(session) {
@@ -55,12 +55,15 @@ function createTools({ sessionId, leaseToken, config, signal }) {
       // Recheck resolution/lease after reserving. An already submitted SMS cannot be recalled.
       const currentSession = await load();
       const currentContact = await Contact.findById(contact._id).lean();
-      if (!currentContact?.isActive || String(currentContact.profileId) !== String(currentSession.profileId) || currentContact.contactNumber !== contact.contactNumber || currentContact.via !== "SMS" || currentSession.acknowledgments.some(a => String(a.contactId) === String(contact._id))) throw new Error("Contact changed or acknowledged before sending");
+      if (canFollowUp({ ...currentSession, followupCount: session.followupCount }, currentContact, config)) throw new Error("Contact changed or responded before sending");
+      let link;
+      try { if (config.baseUrl) link = await issueContactLink(sessionId, contact._id, config); }
+      catch { /* Link failure must not suppress the approved alert. */ }
       signal?.throwIfAborted();
       submitted = true;
       const sent = await sendMessage({
         to: `+91${contact.contactNumber}`,
-        body: `Suraksha follow-up ${session.reference}: An SOS remains open. Please check on the person. ${location.fresh ? "Latest" : "Last known"} location: ${location.mapsLink}\nReply ACK ${session.reference} to acknowledge, or include ${session.reference} in your reply.`,
+        body: `Suraksha follow-up ${session.reference}: An SOS remains open. Please check on the person. ${location.fresh ? "Latest" : "Last known"} location: ${location.mapsLink}\nReplies to this SMS are not supported.${link ? ` Respond securely: ${link}\nKeep this link private.` : ' Contact the person directly.'}`,
         statusCallback: callbackUrl(sessionId, attemptId, config),
       });
       result = { status: ["failed", "undelivered", "canceled"].includes(sent.status) ? "failed" : "accepted", sid: sent.sid };
@@ -72,6 +75,18 @@ function createTools({ sessionId, leaseToken, config, signal }) {
     return result;
   }
   const tools = {
+    async getResponderStatus() {
+      const s = await load();
+      return { assigned: Boolean(s.activeResponder), status: s.activeResponder?.currentStatus, tracking: s.responderTracking, escalationStage: s.escalationStage, escalationState: s.escalationState };
+    },
+    async getNearbyResponderSummary() {
+      const s = await load();
+      return { counts: (s.nearbyResponderRequests || []).reduce((counts, r) => { counts[r.status] = (counts[r.status] || 0) + 1; return counts; }, {}), radiusMeters: s.emergencyGeofence?.radiusMeters };
+    },
+    async getGeoSafetyStatus() {
+      const s = await load();
+      return { signals: s.geoRiskSignals || [], locationObservedAt: s.latestVictimLocation?.observedAt, events: (s.geoEvents || []).slice(-10) };
+    },
     async getEmergencyContext() {
       const session = await load();
       const contacts = await Contact.find({ profileId: session.profileId, isActive: true, via: "SMS", _id: { $in: session.recipients.map(r => r.contactId) } }).lean();
@@ -83,7 +98,11 @@ function createTools({ sessionId, leaseToken, config, signal }) {
         remainingFollowups: Math.max(0, config.maxMessages - session.followupCount),
       };
     },
-    async getContactResponses() { const session = await load(); return { acknowledgments: session.acknowledgments, replies: session.events.filter(e => e.type === "contact_reply").slice(-20) }; },
+    async getContactResponses() { const session = await load(); return {
+      acknowledgments: session.acknowledgments,
+      responses: session.recipients.map(r => ({ contactId: String(r.contactId), status: r.responseStatus || 'pending', respondedAt: r.respondedAt })),
+      replies: session.events.filter(e => e.type === "contact_reply").slice(-20),
+    }; },
     async getLatestLocation() { return latestLocation(await load()); },
     recordUpdate,
     async sendFollowUp({ contactId, reason }) {

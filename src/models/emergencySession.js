@@ -29,6 +29,7 @@ const actionSchema = new Schema({
 });
 const sessionSchema = new Schema(
   {
+    ...require('../coordination/schema').fields,
     profileId: {
       type: Schema.Types.ObjectId,
       ref: "user",
@@ -54,14 +55,23 @@ const sessionSchema = new Schema(
     severity: String,
     location: { mapsLink: String, observedAt: Date },
     recipients: [
-      { contactId: Schema.Types.ObjectId, label: String, number: String },
+      {
+        contactId: Schema.Types.ObjectId, label: String, number: String,
+        responseTokenHashes: { type: [String], default: undefined },
+        responseStatus: { type: String, enum: ['pending', 'coming', 'cannot_help', 'arrived'], default: 'pending' },
+        respondedAt: Date,
+        lastLocation: {
+          latitude: Number, longitude: Number, accuracy: Number,
+          observedAt: Date, receivedAt: Date,
+        },
+      },
     ],
     attempts: [attemptSchema],
     actions: [actionSchema],
     events: [
       {
         key: String,
-        type: String,
+        type: { type: String },
         contactId: Schema.Types.ObjectId,
         text: String,
         at: { type: Date, default: Date.now },
@@ -81,10 +91,17 @@ const sessionSchema = new Schema(
     runCount: { type: Number, default: 0 },
     followupCount: { type: Number, default: 0 },
     lastError: String,
+    aiFailureCount: { type: Number, default: 0 },
+    aiRetryAfter: Date,
     resolvedAt: Date,
   },
   { timestamps: true },
 );
 sessionSchema.index({ ready: 1, status: 1, nextRunAt: 1, leaseUntil: 1 });
 sessionSchema.index({ "attempts.sid": 1 });
+sessionSchema.index({ 'recipients.responseTokenHashes': 1 });
+sessionSchema.index({ status: 1, coordinationNextRunAt: 1 });
+sessionSchema.index({ 'nearbyResponderRequests.responderUserId': 1, status: 1 });
+// One responder cannot be primary on two incidents, even across API processes.
+sessionSchema.index({ 'activeResponder.userId': 1 }, { unique: true, partialFilterExpression: { 'activeResponder.userId': { $type: 'objectId' } } });
 module.exports = mongoose.model("EmergencySession", sessionSchema);

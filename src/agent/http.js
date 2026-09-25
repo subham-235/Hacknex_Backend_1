@@ -12,21 +12,49 @@ function verifyTwilio(req, res, next) {
   next();
 }
 
-function createHandlers({ Session, Contact, recordAttempt }) {
+function createHandlers({ Session, Contact, recordAttempt, notify = async () => {} }) {
+  function present(session) {
+    const { getCurrentEmergencyCenter, tracking } = require('../coordination/geo');
+    const center = getCurrentEmergencyCenter(session);
+    const open = [...ACTIVE, 'review_required'].includes(session.status) && +new Date(session.expiresAt) > Date.now();
+    return { ...session,
+      recipients: (session.recipients || []).map(({ responseTokenHashes, ...recipient }) => ({
+        ...recipient,
+        tracking: open && ['coming', 'arrived'].includes(recipient.responseStatus) ? tracking(center, recipient.lastLocation) : null,
+      })),
+      latestVictimLocation: center, responderTracking: open ? tracking(center, session.activeResponder?.lastLocation) : null };
+  }
   const idValid = id => typeof id === "string" && /^[a-f0-9]{24}$/i.test(id);
   const owned = req => ({ _id: req.params.id, profileId: req.user._id });
+  function diagnostics(req, res) {
+    const { baseUrl, mode } = getConfig();
+    return res.json({
+      mode,
+      callbacksConfigured: Boolean(baseUrl && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_ACCOUNT_SID),
+      incomingWebhookUrl: baseUrl ? `${baseUrl}/agent/webhooks/incoming` : null,
+      responseLinksConfigured: Boolean(baseUrl),
+      replyNotice: 'Twilio SMS to Indian mobile numbers is one-way. Contacts can instead open the secure link in newly sent alerts to respond and optionally share location. Response links require a public HTTPS backend.',
+    });
+  }
   async function list(req, res) {
     const sessions = await Session.find({ profileId: req.user._id }).sort({ createdAt: -1 }).limit(20).lean();
-    return res.json({ sessions });
+    return res.json({ sessions: sessions.map(present) });
   }
   async function detail(req, res) {
     if (!idValid(req.params.id)) return res.status(400).json({ error: "Invalid session ID" });
     const session = await Session.findOne(owned(req)).lean();
-    return session ? res.json({ session }) : res.status(404).json({ error: "Session not found" });
+    return session ? res.json({ session: present(session) }) : res.status(404).json({ error: "Session not found" });
   }
   async function resolve(req, res) {
     if (!idValid(req.params.id)) return res.status(400).json({ error: "Invalid session ID" });
-    const session = await Session.findOneAndUpdate(owned(req), { $set: { status: "resolved", resolvedAt: new Date() } }, { new: true }).lean();
+    // Legacy sessions predate embedded requests; arrayFilters require the path.
+    await Session.updateOne({ ...owned(req), nearbyResponderRequests: { $exists: false } }, { $set: { nearbyResponderRequests: [] } });
+    const session = await Session.findOneAndUpdate(owned(req), { $set: { status: "resolved", resolvedAt: new Date(), activeResponder: null, responderTracking: null, "nearbyResponderRequests.$[open].status": "cancelled" } }, { returnDocument: 'after', arrayFilters: [{ "open.status": { $in: ["pending", "accepted"] } }] }).lean();
+    if (session) {
+      for (const profileId of [session.profileId, ...(session.nearbyResponderRequests || []).map(r => r.responderUserId)]) {
+        try { await notify({ profileId: String(profileId), sessionId: String(session._id), type: 'agent-session-updated' }); } catch { /* API polling recovers missed notifications. */ }
+      }
+    }
     return session ? res.json({ session }) : res.status(404).json({ error: "Session not found" });
   }
   function decideAction(state) {
@@ -59,18 +87,22 @@ function createHandlers({ Session, Contact, recordAttempt }) {
     if (!recipient) return empty();
     const contact = await Contact.findOne({ _id: recipient.contactId, profileId: session.profileId, isActive: true, contactNumber: recipient.number }).lean();
     if (!contact) return empty();
-    await Session.updateOne({ _id: session._id, status: { $in: [...ACTIVE, "review_required"] }, expiresAt: { $gt: new Date() }, processedMessageSids: { $ne: req.body.MessageSid }, $expr: { $lt: [{ $size: "$processedMessageSids" }, 100] } }, {
+    const stored = await Session.updateOne({ _id: session._id, status: { $in: [...ACTIVE, "review_required"] }, expiresAt: { $gt: new Date() }, processedMessageSids: { $ne: req.body.MessageSid }, $expr: { $lt: [{ $size: { $ifNull: ["$processedMessageSids", []] } }, 100] } }, {
       $addToSet: { processedMessageSids: req.body.MessageSid },
       $push: { events: { $each: [{ key: req.body.MessageSid, type: "contact_reply", contactId: recipient.contactId, text: parsed.text, at: new Date() }], $slice: -100 } },
       $min: { nextRunAt: new Date() },
     });
-    if (parsed.acknowledged) await Session.updateOne({ _id: session._id, processedMessageSids: req.body.MessageSid, status: { $in: [...ACTIVE, "review_required"] }, acknowledgments: { $not: { $elemMatch: { contactId: recipient.contactId } } } }, {
+    const acknowledgment = parsed.acknowledged ? await Session.updateOne({ _id: session._id, processedMessageSids: req.body.MessageSid, expiresAt: { $gt: new Date() }, status: { $in: [...ACTIVE, "review_required"] }, acknowledgments: { $not: { $elemMatch: { contactId: recipient.contactId } } } }, {
       $push: { acknowledgments: { contactId: recipient.contactId, at: new Date() } },
       // Preserve review_required after the run budget is exhausted.
-    });
-    if (parsed.acknowledged) await Session.updateOne({ _id: session._id, status: "active", "acknowledgments.contactId": recipient.contactId }, { $set: { status: "acknowledged" } });
+    }) : null;
+    if (parsed.acknowledged) await Session.updateOne({ _id: session._id, status: "active", expiresAt: { $gt: new Date() }, "acknowledgments.contactId": recipient.contactId }, { $set: { status: "acknowledged" } });
+    if (stored.modifiedCount || acknowledgment?.modifiedCount) {
+      try { await notify({ profileId: String(session.profileId), sessionId: String(session._id), type: 'agent-session-updated' }); }
+      catch { /* Persisted replies remain visible through dashboard polling. */ }
+    }
     return empty();
   }
-  return { list, detail, resolve, approve: decideAction("approved"), reject: decideAction("rejected"), delivery, incoming };
+  return { list, detail, diagnostics, resolve, approve: decideAction("approved"), reject: decideAction("rejected"), delivery, incoming };
 }
 module.exports = { createHandlers, verifyTwilio };

@@ -14,6 +14,12 @@ function loadController(name, dependencies) {
     console: { log() {}, error() {} },
     require(id) {
       if (id === "../utils/locationParser") return parser;
+      if (id === '../coordination/config') return require('../src/coordination/config');
+      if (id === "../coordination/presence") return { updatePresence: async (profileId, body) => {
+        const p = parser.parseLatLon(body.location || body, body.lon);
+        if (!p) throw Object.assign(new Error('Invalid location'), { status: 400 });
+        await dependencies['../models/activeUser'].findOneAndUpdate({ profileId }, { location: { type: 'Point', coordinates: [p.lon, p.lat] } });
+      } };
       if (id === "../agent/sessions" && !Object.hasOwn(dependencies, id)) return { createSession: async () => null, wakeForLocation: async () => {} };
       assert.ok(Object.hasOwn(dependencies, id), `Unexpected dependency: ${id}`);
       return dependencies[id];
@@ -29,9 +35,14 @@ for (const unavailable of [false, true]) {
     const trigger = loadController("trigger.js", {
       "../models/user": {},
       "../models/contact": { find: async () => contacts },
-      "../services/llmsupport": { analyzeAudioDirectly: async () => ({ isDistress: true, confidence: 95, severity: "high", transcript: "Help", summary: "Help needed" }) },
+      "../services/llmsupport": { analyzeAudioDirectly: async paths => {
+        if (unavailable) assert.deepEqual(Array.from(paths), ["first.webm", "second.webm"]);
+        else assert.equal(paths, "mock.webm");
+        return { isDistress: true, confidence: 95, severity: "high", transcript: "Help", summary: "Help needed" };
+      } },
       "../agent/sessions": {
-        createSession: async () => {
+        createSession: async (profileId, analysis, location) => {
+          assert.equal(location, "https://maps.google.com/?q=22,88");
           events.push("session");
           if (unavailable) throw new Error("Tracking unavailable");
           return { _id: "s1", reference: "ABCDEF123456", attempts: [{ _id: "a1", contactId: "c1" }] };
@@ -41,6 +52,7 @@ for (const unavailable of [false, true]) {
         finishInitial: async (session, history) => { events.push(history ? "linked" : "ready"); },
       },
       "../services/smsAlart": { sendSOSAlert: async (summary, location, recipients, options) => {
+        assert.equal(location, "https://maps.google.com/?q=22,88");
         events.push("sms");
         if (!unavailable) {
           assert.equal(options.reference, "ABCDEF123456");
@@ -55,7 +67,7 @@ for (const unavailable of [false, true]) {
       "../socket": { getIO: () => ({}) },
     });
     const res = response();
-    await trigger({ file: { path: "mock.webm" }, body: { location: "22,88" }, user: { _id: "u1" } }, res);
+    await trigger({ ...(unavailable ? { files: [{ path: "first.webm" }, { path: "second.webm" }] } : { file: { path: "mock.webm" } }), body: { location: "22,88" }, user: { _id: "u1" } }, res);
     assert.equal(res.code, 200);
     assert.equal(res.body.sent, true);
     assert.equal(res.body.agentTrackingError, unavailable);
@@ -113,8 +125,15 @@ for (const statuses of [["sent", "sent"], ["sent", "failed"], ["failed", "failed
       "../services/smsAlart": { async sendSOSAlert() { return statuses.map(status => ({ status })); } },
       "../models/history": { async create(data) { histories.push(data); return { _id: "h1" }; } },
       "../models/incident": { async create(data) { incidents.push(data); } },
-      "../models/activeUser": { async find() { return [{ socketId: "socket1" }]; } },
-      "../socket": { getIO() { return { to() { return { emit(event) { notifications.push(event); } }; } }; } },
+      "../models/activeUser": { async find(filter) {
+        assert.equal(filter.profileId.$ne, "user1");
+        assert.ok(filter.expireAt.$gt);
+        return [{ profileId: "helper1", socketId: null }, { profileId: "helper2", socketId: "stale-socket" }];
+      } },
+      "../socket": { publishNearbyAlert(profileId, payload) {
+        assert.equal(payload.mapsLink, undefined, "Unassigned users must not receive precise victim location");
+        notifications.push({ room: `user:${profileId}`, event: "nearby-sos" });
+      } },
     });
     const res = response();
     await trigger({ file: { path: "mock.webm" }, body: { location: "22.5,88.3" }, user: { _id: "user1" } }, res);
@@ -128,7 +147,22 @@ for (const statuses of [["sent", "sent"], ["sent", "failed"], ["failed", "failed
     assert.deepEqual(res.body.failedTo, failed.map(contact => contact.contactNumber));
     assert.deepEqual(Array.from(histories[0].sent), successful.map(contact => contact._id));
     assert.equal(incidents.length, 1);
-    assert.deepEqual(notifications, ["nearby-sos"]);
+    assert.deepEqual(notifications, [
+      { room: "user:helper1", event: "nearby-sos" },
+      { room: "user:helper2", event: "nearby-sos" },
+    ]);
     if (!successful.length) assert.equal(res.body.error, "All SMS alert attempts failed");
   });
 }
+
+test('public heatmap coarsens precise incident locations', async () => {
+  const controller = loadController('incidentController.js', {
+    '../models/incident': { find: () => ({ select() { return this; }, limit: async () => [{ location: { coordinates: [88.363913, 22.572612] }, severity: 5 }] }) },
+  });
+  const res = response();
+  await controller.getHeatmap({}, res);
+  assert.equal(res.code, 200);
+  assert.equal(res.body.approximate, true);
+  assert.ok(res.body.areaRadiusMeters >= 700);
+  assert.deepEqual(res.body.heatmapPoints, [[22.57, 88.36, 1]]);
+});

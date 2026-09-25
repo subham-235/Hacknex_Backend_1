@@ -15,9 +15,12 @@ const getHeatmap = async (req, res) => {
       .select("location severity incidentType")
       .limit(500);
 
+    // Public heatmap is an approximate area view, never a precise rescue locator.
+    const { heatmapGridDegrees } = require('../coordination/config').getGeoConfig();
+    const coarse = value => Number((Math.round(value / heatmapGridDegrees) * heatmapGridDegrees).toFixed(3));
     const heatmapPoints = incidents.map((inc) => [
-      inc.location.coordinates[1],   // lat
-      inc.location.coordinates[0],   // lon
+      coarse(inc.location.coordinates[1]),
+      coarse(inc.location.coordinates[0]),
       inc.severity / 5,              // intensity 0-1
     ]);
 
@@ -25,6 +28,8 @@ const getHeatmap = async (req, res) => {
       success: true,
       count: incidents.length,
       heatmapPoints,
+      approximate: true,
+      areaRadiusMeters: Math.round(heatmapGridDegrees * 111195 * Math.SQRT2 / 2),
     });
 
   } catch (err) {

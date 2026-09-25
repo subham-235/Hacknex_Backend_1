@@ -263,6 +263,59 @@ test("incoming replies are deduplicated by SID and ACK never resolves an emergen
   assert.equal(writes.at(-1).update.$set.status, "acknowledged");
   assert.ok(!writes.some(write => write.update.$set?.status === "resolved"));
 });
+
+test('stored ordinary replies refresh the dashboard even while AI review is paused', async () => {
+  const notifications = [], writes = [];
+  const handlers = createHandlers({
+    Session: {
+      findOne: () => ({ lean: async () => fixture({ status: 'review_required', lastError: 'Gemini rate limit' }) }),
+      updateOne: async (filter, update) => { writes.push({ filter, update }); return { modifiedCount: 1 }; },
+    },
+    Contact: { findOne: () => ({ lean: async () => contact }) },
+    notify: async event => notifications.push(event),
+  });
+  await handlers.incoming({ body: { Body: 'ABCDEF123456 I am on my way', MessageSid: SID, From: '+919999999999' } }, response());
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].update.$push.events.$each[0].text, 'ABCDEF123456 I am on my way');
+  assert.equal(writes[0].update.$set, undefined);
+  assert.deepEqual(notifications, [{ profileId: USER, sessionId: ID, type: 'agent-session-updated' }]);
+});
+
+test('duplicate ordinary replies do not send repeated live updates', async () => {
+  const handlers = createHandlers({
+    Session: { findOne: () => ({ lean: async () => fixture() }), updateOne: async () => ({ modifiedCount: 0 }) },
+    Contact: { findOne: () => ({ lean: async () => contact }) },
+    notify: () => assert.fail('Duplicate notification'),
+  });
+  await handlers.incoming({ body: { Body: 'ABCDEF123456 hello', MessageSid: SID, From: '+919999999999' } }, response());
+});
+
+test('socket failure does not fail a persisted inbound reply', async () => {
+  const handlers = createHandlers({
+    Session: { findOne: () => ({ lean: async () => fixture() }), updateOne: async () => ({ modifiedCount: 1 }) },
+    Contact: { findOne: () => ({ lean: async () => contact }) },
+    notify: async () => { throw new Error('Socket unavailable'); },
+  });
+  const res = response();
+  await handlers.incoming({ body: { Body: 'ABCDEF123456 hello', MessageSid: SID, From: '+919999999999' } }, res);
+  assert.equal(res.body, '<Response></Response>');
+});
+
+test('diagnostics expose callback readiness without exposing Twilio credentials', () => {
+  const previous = process.env.PUBLIC_BASE_URL;
+  try {
+    delete process.env.PUBLIC_BASE_URL;
+    const res = response();
+    createHandlers({}).diagnostics({}, res);
+    assert.equal(res.body.callbacksConfigured, false);
+    assert.equal(res.body.incomingWebhookUrl, null);
+    assert.match(res.body.replyNotice, /one-way/);
+    assert.equal(Object.hasOwn(res.body, 'TWILIO_AUTH_TOKEN'), false);
+  } finally {
+    if (previous === undefined) delete process.env.PUBLIC_BASE_URL;
+    else process.env.PUBLIC_BASE_URL = previous;
+  }
+});
 test("delivery callback must match the session recipient and provider SID", async () => {
   const handlers = createHandlers({ Session: { findById: () => ({ lean: async () => fixture({ attempts: [{ _id: ACTION, contactId: CONTACT, sid: SID }] }) }) }, recordAttempt: () => assert.fail("Mismatched callback accepted") });
   const res = response();
@@ -297,26 +350,48 @@ test("initial SMS tracking failures never stop alerts to remaining contacts", as
   assert.equal(results[1].status, "sent");
 });
 
+test('initial SMS includes a per-contact secure response link and still sends if link creation fails', async () => {
+  const messages = [];
+  const { sendSOSAlert } = load('services/smsAlart.js', { './smsGateway': { sendMessage: async message => { messages.push(message); return { sid: SID, status: 'queued' }; } } });
+  let attempts = 0;
+  await sendSOSAlert('Help', '22,88', [contact, contact], {
+    reference: 'ABCDEF123456',
+    responseLink: async () => { if (++attempts === 2) throw new Error('Unavailable'); return 'https://example.test/agent/respond#private-token'; },
+  });
+  assert.equal(messages.length, 2);
+  assert.match(messages[0].body, /Respond securely.*https:\/\/example.test\/agent\/respond#private-token/);
+  assert.doesNotMatch(messages[1].body, /private-token|Reply ACK/);
+});
+
 test("authenticated sockets cannot register as another profile", async () => {
   let middleware;
   let connection;
   let registered = 0;
   const handlers = {};
   const joined = [];
+  const replayed = [];
   const jwt = require("jsonwebtoken");
   const previous = process.env.JWT_KEY;
   process.env.JWT_KEY = "test-socket-key";
   try {
-    const { initSocket } = load("socket.js", {
-      "socket.io": { Server: class { use(fn) { middleware = fn; } on(name, fn) { connection = fn; } } },
-      "./models/activeUser": { findOneAndUpdate: async () => { registered++; } },
+    const { initSocket, publishNearbyAlert } = load("socket.js", {
+      "./nearbyAlerts": require("../src/nearbyAlerts"),
+      "socket.io": { Server: class {
+        use(fn) { middleware = fn; }
+        on(name, fn) { connection = fn; }
+        to() { return { emit() {} }; }
+      } },
+      "./models/activeUser": { findOneAndUpdate: async (filter, update) => {
+        assert.equal(update.isActive, undefined, "Socket changes must preserve the helper's sharing choice");
+        registered++;
+      } },
       jsonwebtoken: jwt,
       "./models/user": { exists: async () => true },
       "./config/redis": { exists: async () => false },
     });
     initSocket({});
     const token = jwt.sign({ _id: USER }, "test-socket-key", { expiresIn: 60 });
-    const socket = { handshake: { headers: { cookie: `token=${token}` } }, data: {}, join: room => joined.push(room), on: (name, fn) => { handlers[name] = fn; }, disconnect() {} };
+    const socket = { handshake: { headers: { cookie: `token=${token}` } }, data: {}, join: room => joined.push(room), on: (name, fn) => { handlers[name] = fn; }, emit: (event, payload) => replayed.push({ event, payload }), disconnect() {} };
     await middleware(socket, error => assert.equal(error, undefined));
     connection(socket);
     await handlers.register("someone-else");
@@ -324,6 +399,12 @@ test("authenticated sockets cannot register as another profile", async () => {
     await handlers.register(USER);
     assert.equal(registered, 1);
     assert.deepEqual(joined, [`user:${USER}`]);
+    publishNearbyAlert(USER, { message: "Own nearby alert" });
+    publishNearbyAlert("someone-else", { message: "Another helper's alert" });
+    handlers['nearby-sos-sync']("someone-else");
+    assert.equal(replayed.length, 1);
+    assert.equal(replayed[0].event, "nearby-sos");
+    assert.equal(replayed[0].payload.message, "Own nearby alert");
     await handlers.disconnect();
   } finally { if (previous === undefined) delete process.env.JWT_KEY; else process.env.JWT_KEY = previous; }
 });

@@ -3,6 +3,8 @@ const ActiveUser = require("./models/activeUser");
 const jwt = require("jsonwebtoken");
 const User = require("./models/user");
 const redisClient = require("./config/redis");
+const { createNearbyAlerts } = require("./nearbyAlerts");
+const nearbyAlerts = createNearbyAlerts();
 
 let io = null;
 
@@ -39,12 +41,23 @@ const initSocket = (httpServer) => {
   });
 
   io.on("connection", (socket) => {
+    const connectedAt = Date.now();
     socket.join(`user:${socket.data.profileId}`);
     const expiryTimer = setTimeout(
       () => socket.disconnect(true),
       Math.max(0, socket.data.tokenExpiresAt - Date.now()),
     );
     console.log("Socket connected:", socket.id);
+    socket.on("nearby-sos-sync", () => {
+      for (const alert of nearbyAlerts.list(socket.data.profileId)) {
+        socket.emit("nearby-sos", alert);
+      }
+    });
+    socket.on("nearby-sos-received", (id) => {
+      if (nearbyAlerts.list(socket.data.profileId).some(alert => alert.id === id)) {
+        console.log("Nearby SOS received by helper browser:", id);
+      }
+    });
 
     // User registers their socket ID when app opens
     socket.on("register", async (profileId) => {
@@ -62,14 +75,21 @@ const initSocket = (httpServer) => {
     });
 
     // User disconnects — clean up
-    socket.on("disconnect", async () => {
+    socket.on("disconnect", async (reason) => {
       clearTimeout(expiryTimer);
+      // Log before database cleanup, which may be slow or fail.
+      console.log("Socket disconnected:", socket.id, {
+        reason,
+        connectedForMs: Date.now() - connectedAt,
+        transport: socket.conn?.transport?.name,
+      });
       try {
         await ActiveUser.findOneAndUpdate(
           { socketId: socket.id },
-          { socketId: null, isActive: false },
+          // Sharing ends explicitly or when its location expires. A transport
+          // disconnect must not disable a helper after reconnect or in another tab.
+          { socketId: null },
         );
-        console.log("Socket disconnected:", socket.id);
       } catch (err) {
         console.error("Socket disconnect error:", err.message);
       }
@@ -84,4 +104,9 @@ const getIO = () => {
   return io;
 };
 
-module.exports = { initSocket, getIO };
+const publishNearbyAlert = (profileId, payload) => {
+  const alert = nearbyAlerts.add(profileId, payload);
+  getIO().to(`user:${profileId}`).emit("nearby-sos", alert);
+};
+
+module.exports = { initSocket, getIO, publishNearbyAlert };

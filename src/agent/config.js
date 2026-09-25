@@ -14,6 +14,9 @@ function getConfig(env = process.env) {
       throw new Error("PUBLIC_BASE_URL must be an HTTPS origin without a path or credentials");
     }
   }
+  const timeoutMs = integer(env, 'AGENT_RUN_TIMEOUT_SECONDS', 180, 30, 300) * 1000;
+  const modelTimeoutMs = integer(env, 'AGENT_MODEL_TIMEOUT_SECONDS', 90, 10, 180) * 1000;
+  if (modelTimeoutMs > timeoutMs) throw new Error('Model timeout must not exceed agent run timeout');
   return {
     mode, baseUrl, model: env.AGENT_MODEL || env.GEMINI_MODEL || "gemini-3.6-flash",
     checkMs: integer(env, "AGENT_CHECK_SECONDS", 60, 30, 600) * 1000,
@@ -21,8 +24,11 @@ function getConfig(env = process.env) {
     maxRuns: integer(env, "AGENT_MAX_RUNS", 12, 1, 60),
     maxMessages: integer(env, "AGENT_MAX_FOLLOWUPS", 3, 1, 10),
     maxToolCalls: 6,
-    timeoutMs: 30000,
-    leaseMs: 120000,
+    timeoutMs, modelTimeoutMs,
+    keyCooldownMs: integer(env, "GEMINI_KEY_COOLDOWN_SECONDS", 60, 5, 3600) * 1000,
+    leaseMs: timeoutMs + 60000,
+    retryBaseMs: 60000,
+    retryMaxMs: 600000,
   };
 }
 

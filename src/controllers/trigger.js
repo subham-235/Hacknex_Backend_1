@@ -5,17 +5,18 @@ const { sendSOSAlert } = require("../services/smsAlart");
 const History = require("../models/history");
 const ActiveUser = require("../models/activeUser");
 const Incident = require("../models/incident");
-const { getIO } = require("../socket");
+const { publishNearbyAlert } = require("../socket");
 const { parseLatLon } = require("../utils/locationParser");
-const { createSession, callbackUrl, recordAttempt, finishInitial } = require("../agent/sessions");
+const { createSession, callbackUrl, recordAttempt, finishInitial, issueContactLink } = require("../agent/sessions");
 
 // Sobchey main Api
 const trigger = async (req, res) => {
-  const audioPath = req.file?.path;
+  const audioPaths = req.files?.map(file => file.path) || (req.file ? [req.file.path] : []);
+  const startedAt = Date.now();
   try {
     const { location, confidence } = req.body;
 
-    if (!req.file) {
+    if (!audioPaths.length) {
       return res.status(400).json({
         error: "No audio file received",
       });
@@ -28,12 +29,16 @@ const trigger = async (req, res) => {
     }
 
     // Google Maps link or string from frontend
-    const mapsLink = typeof location === "string" ? location : String(location);
+    const parsedCoords = parseLatLon(location, req.body.lon ?? req.body.lng);
+    const mapsLink = parsedCoords
+      ? `https://maps.google.com/?q=${parsedCoords.lat},${parsedCoords.lon}`
+      : String(location);
 
     const analysis = await analyzeAudioDirectly(
-      audioPath,
+      audioPaths.length === 1 ? audioPaths[0] : audioPaths,
       mapsLink
     );
+    console.log("SOS timing", { stage: "analysis_complete", elapsedMs: Date.now() - startedAt });
 
     if (!analysis.isDistress || analysis.confidence < 70) {
       return res.status(200).json({
@@ -71,12 +76,14 @@ const trigger = async (req, res) => {
       contacts,
       agentSession ? {
         reference: agentSession.reference,
+        responseLink: contact => issueContactLink(agentSession._id, contact._id),
         statusCallback: contact => callbackUrl(agentSession._id, attemptFor(contact)._id),
         onResult: (contact, result) => recordAttempt(agentSession._id, attemptFor(contact)._id, {
           ...result, status: result.deliveryStatus || (result.status === "sent" ? "accepted" : "failed"),
         }),
       } : {}
     );
+    console.log("SOS timing", { stage: "sms_submissions_complete", elapsedMs: Date.now() - startedAt });
     // Ready even if a later history write fails: follow-up can still proceed.
     if (agentSession) {
       try { await finishInitial(agentSession._id); }
@@ -119,9 +126,6 @@ const trigger = async (req, res) => {
       catch (error) { agentTrackingError = true; console.error("Agent history link failed:", error.name); }
     }
 
-    // Parse coordinates embedded in the Google Maps link
-    const parsedCoords = parseLatLon(mapsLink, req.body.lon || req.body.lng);
-
     // Notify nearby users & save incident if lat and lon are present
     if (parsedCoords) {
       const { lat: parsedLat, lon: parsedLon } = parsedCoords;
@@ -139,39 +143,15 @@ const trigger = async (req, res) => {
           timeOfDay: getTimeOfDay(),
         });
 
-        // Find active community users within 500m
-        const nearbyUsers = await ActiveUser.find({
-          isActive: true,
-          profileId: { $ne: profileId },   // exclude victim
-          location: {
-            $near: {
-              $geometry: {
-                type: "Point",
-                coordinates: [parsedLon, parsedLat],
-              },
-              $maxDistance: 500,   // 500 meters
-            },
-          },
-        });
-
-        // Broadcast notification via Socket.io
-        if (nearbyUsers.length > 0) {
-          const io = getIO();
-
-          nearbyUsers.forEach((user) => {
-            if (user.socketId) {
-              io.to(user.socketId).emit("nearby-sos", {
-                message: "Someone nearby needs help!",
-                distance: "Within 500m of your location",
-                mapsLink: mapsLink.startsWith("http") ? mapsLink : `https://maps.google.com/?q=${parsedLat},${parsedLon}`,
-                severity: severity,
-                timeOfDay: getTimeOfDay(),
-              });
-            }
-          });
-
-          console.log(`Notified ${nearbyUsers.length} nearby users via Socket.io`);
+        // Durable requests replace the transient broadcast when a session exists.
+        // Keep the original nearby alert fallback if tracking could not be created.
+        if (!agentSession) {
+          const nearbyUsers = await ActiveUser.find({ isActive: true, expireAt: { $gt: new Date() }, profileId: { $ne: profileId }, location: { $near: { $geometry: { type: "Point", coordinates: [parsedLon, parsedLat] }, $maxDistance: 500 } } });
+          nearbyUsers.forEach(user => publishNearbyAlert(user.profileId, {
+            message: "Someone nearby needs help!", distance: "Within 500m of your location", severity,
+          }));
         }
+
       } catch (geoErr) {
         console.error("Error processing nearby notification / incident recording:", geoErr.message);
       }

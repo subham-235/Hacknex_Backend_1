@@ -1,6 +1,7 @@
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
+const { randomUUID } = require("node:crypto");
 
 const userMiddleware = require("../middleware/userMiddleware");
 const trigger = require("../controllers/trigger");
@@ -26,7 +27,7 @@ const storage = multer.diskStorage({
 
     cb(
       null,
-      `audio_${Date.now()}.webm`
+      `audio_${randomUUID()}.webm`
     );
   },
 
@@ -39,14 +40,14 @@ const upload = multer({
 
   limits: {
     fileSize: 10 * 1024 * 1024,
+    files: 5,
   },
 });
 
-console.log(upload.single("audio"));
 authSos.post(
   "/trigger",
   userMiddleware,
-  upload.single("audio"),
+  upload.array("audio", 5),
   trigger
 );
 

@@ -3,6 +3,7 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const validate = require("../utils/validator");
 const redisClient=require("../config/redis");
+const { authCookieOptions, clearAuthCookieOptions } = require("../config/authCookie");
 
 const register = async (req, res) => {
   try {
@@ -28,7 +29,7 @@ const register = async (req, res) => {
       role: user.role,
     };
 
-    res.cookie("token", token, { maxAge: 60 * 60 * 1000 });
+    res.cookie("token", token, authCookieOptions());
     res.status(201).json({
       user: reply,
       massage: "Registered Successfully...",
@@ -68,7 +69,7 @@ const login = async (req, res) => {
     _id: user._id,
     role: user.role,
   };
-  res.cookie("token", token, { maxAge: 60 * 60 * 1000 });
+  res.cookie("token", token, authCookieOptions());
   res.status(200).json({
       user: reply,
       massage: "Login Successfully...",
@@ -90,7 +91,7 @@ const payload=jwt.decode(token);
 await redisClient.set(`token:${token}`,'Blocked');
 await redisClient.expireAt(`token:${token}`,payload.exp);
 
-res.cookie("token",null,{expires:new Date(Date.now())});
+res.clearCookie("token", clearAuthCookieOptions());
 res.send("Logged out Successfully...")
   } catch (err) {
     res.status(503).send("Error : " + err.message);
@@ -99,6 +100,7 @@ res.send("Logged out Successfully...")
 
 const authenticat=async (req,res)=>{
   try{
+     const user = req.user;
      const reply = {
     fullName: user.fullName,
     emailId: user.emailId,
@@ -109,7 +111,7 @@ const authenticat=async (req,res)=>{
       user: reply,
       massage: "User Authenticated...",
     });
-  }catch{
+  }catch(err){
  res.status(401).send("Error : " + err.message);
   }
  
@@ -138,7 +140,7 @@ const adminRegister=async (req,res)=>{
       role: user.role,
     };
 
-    res.cookie("token",token, { maxAge: 60 * 60 * 1000 });
+    res.cookie("token",token, authCookieOptions());
      res.status(201).json({
       user: reply,
       massage: "Registered Successfully...",
