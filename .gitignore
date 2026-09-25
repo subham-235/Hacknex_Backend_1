@@ -1,0 +1,10 @@
+node_modules
+.npm-cache/
+.cache/
+.env
+.env.*
+!.env.example
+uploads/
+src/uploads/
+docs/.render/
+docs/__pycache__/
